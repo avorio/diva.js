@@ -5,9 +5,14 @@ Adds an adjustment icon next to each image
 
 */
 
+var jQuery = require('jquery');
+var diva = require('../diva');
+
+require('../utils/jquery-extensions');
+
 (function ($)
 {
-    window.divaPlugins.push((function ()
+    module.exports = (function ()
     {
         var canvas = {},
             map = {},
@@ -26,7 +31,6 @@ Adds an adjustment icon next to each image
             contrastStep: 0.05,
             localStoragePrefix: 'canvas-',
             mobileWebkitMaxZoom: 2,
-            onInit: null,
             rgbMax: 50,
             rgbMin: -50,
             throbberFadeSpeed: 200,
@@ -304,8 +308,7 @@ Adds an adjustment icon next to each image
         var loadCanvas = function (imageURL, callback)
         {
             image = new Image();
-            image.src = imageURL;
-            image.crossOrigin = "Anonymous";
+            image.crossOrigin = "anonymous";
 
             image.onload = function ()
             {
@@ -367,6 +370,14 @@ Adds an adjustment icon next to each image
                 if (typeof callback === 'function')
                     callback.call(callback);
             };
+
+            image.src = imageURL;
+
+            // make sure the load event fires for cached images too
+            if ( image.complete || image.complete === undefined ) {
+                image.src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+                image.src = imageURL;
+            }
         };
 
         var updateSliderLabel = function ()
@@ -387,12 +398,7 @@ Adds an adjustment icon next to each image
         {
             var width = settings.zoomWidthRatio * Math.pow(2, zoomLevel);
 
-            if (settings.proxyURL)
-                return settings.proxyURL + "?f=" + settings.filename + "&w=" + width;
-
-            var imdir = settings.imageDir + "/";
-
-            return settings.iipServerURL + "?FIF=" + imdir + settings.filename + '&WID=' + width + '&CVT=JPEG';
+            return settings.divaInstance.getPageImageURL(settings.selectedPageIndex, { width: width });
         };
 
         var showThrobber = function ()
@@ -429,7 +435,7 @@ Adds an adjustment icon next to each image
             if (changed)
             {
                 settings.pluginIcon.addClass('new');
-                localStorage.setObject(storageKey, sliderSettings);
+                storeObject(storageKey, sliderSettings);
             }
             else
             {
@@ -487,6 +493,17 @@ Adds an adjustment icon next to each image
             }
         };
 
+        // Serialize an object to JSON and save it in localStorage
+        var storeObject = function (key, value) {
+            localStorage.setItem(key, JSON.stringify(value));
+        };
+
+        // Load and deserialize a localStorage object
+        var loadStoredObject = function (key) {
+            var value = localStorage.getItem(key);
+            return value && JSON.parse(value);
+        };
+
         var retval =
         {
             init: function (divaSettings, divaInstance)
@@ -500,6 +517,7 @@ Adds an adjustment icon next to each image
                 // Override all the configurable settings defined under canvasPlugin
                 $.extend(settings, defaults, divaSettings.canvasPlugin);
 
+                settings.divaInstance = divaInstance;
                 settings.inCanvas = false;
                 settings.iipServerURL = divaSettings.iipServerURL;
                 settings.imageDir = divaSettings.imageDir;
@@ -725,7 +743,7 @@ Adds an adjustment icon next to each image
                                 updateCanvas();
                                 hideThrobber();
 
-                                // Save modifications to localSetttings (also done in updateZoom callback)
+                                // Save modifications to localSettings (also done in updateZoom callback)
                                 saveSettings();
                             }
                         }, settings.throbberTimeout);
@@ -808,23 +826,17 @@ Adds an adjustment icon next to each image
                     $(this).removeClass('grabbing');
                 });
 
-                if (settings.mobileWebkit)
-                {
-                    $('#diva-canvas-wrapper').kinetic();
-                }
-                else
-                {
-                    $('#diva-canvas-wrapper').dragscrollable({
-                        acceptPropagatedEvent: true
-                    });
-                }
+                // touch events
+                $('#diva-canvas-wrapper').kinetic();
 
-                // Execute the onInit callback function, if defined
-                if (typeof settings.onInit === 'function')
-                {
-                    // The context is the diva instance
-                    settings.onInit.call(this, settings);
-                }
+                // mouse events
+                $('#diva-canvas-wrapper').dragscrollable({
+                    acceptPropagatedEvent: true
+                });
+
+                diva.Events.subscribe('ObjectDidLoad', this.setupHook, divaSettings.ID);
+                diva.Events.subscribe('ViewerDidTerminate', this.destroy, divaSettings.ID);
+                diva.Events.subscribe('PageDidLoad', this.onPageLoad, divaSettings.ID);
 
                 return true;
             },
@@ -853,17 +865,24 @@ Adds an adjustment icon next to each image
                 sliders.zoom.max = settings.maxZoomLevel;
             },
 
-            handleClick: function(event, divaSettings, divaInstance)
+            handleClick: function(event, divaSettings, divaInstance, selectedPageIndex)
             {
                 // loadCanvas() calls all the other necessary functions to load
-                var page = $(this).parent().parent();
-                var filename = $(page).attr('data-filename');
-                var width = $(page).width() - 1;
+                var filename = divaInstance.getFilenames()[selectedPageIndex];
+
+                // TODO: Move rationale for -1 from Wiki (TLDR an old IIP bug)
+                var width = divaInstance
+                    .getPageDimensions(selectedPageIndex)
+                    .width - 1;
+
                 var zoomLevel = divaSettings.zoomLevel;
                 var slider;
 
                 settings.zoomWidthRatio = width / Math.pow(2, zoomLevel);
                 settings.pluginIcon = $(this);
+
+                settings.manifest = divaSettings.manifest;
+                settings.selectedPageIndex = selectedPageIndex;
 
                 // Limit the max zoom level if we're on the iPad
                 if (settings.mobileWebkit) {
@@ -875,7 +894,7 @@ Adds an adjustment icon next to each image
                 sliders.zoom.current = zoomLevel;
 
                 // Find the settings stored in localStorage, if they exist
-                var sliderSettings = localStorage.getObject(settings.localStoragePrefix + settings.filename);
+                var sliderSettings = loadStoredObject(settings.localStoragePrefix + settings.filename);
                 if (sliderSettings)
                 {
                     for (slider in sliderSettings)
@@ -913,11 +932,12 @@ Adds an adjustment icon next to each image
                 var imageURL = getImageURL(zoomLevel);
 
                 // Change the title of the page
-                $('#diva-canvas-info').text($(page).attr('title'));
+                // FIXME: This is legacy behaviour. Should this be a filename/label?
+                $('#diva-canvas-info').text('Page ' + (selectedPageIndex + 1));
 
                 showThrobber();
 
-                diva.Events.publish("CanvasViewDidActivate", [page]);
+                diva.Events.publish('CanvasViewDidActivate', [selectedPageIndex]);
 
                 loadCanvas(imageURL);
             },
@@ -943,5 +963,5 @@ Adds an adjustment icon next to each image
         // embedded.
         return retval;
 
-    })());
+    })();
 })(jQuery);
